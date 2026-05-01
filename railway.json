@@ -1,0 +1,4 @@
+{
+  "build": { "builder": "NIXPACKS" },
+  "deploy": { "startCommand": "python technical_agent.py" }
+}
