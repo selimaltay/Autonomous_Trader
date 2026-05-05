@@ -2,7 +2,6 @@ import asyncio
 import datetime
 import logging
 import os
-import aiohttp
 import asyncpg
 import pandas as pd
 import yfinance as yf
@@ -18,10 +17,8 @@ logger = logging.getLogger("TechnicalAgent")
 
 class TechnicalAgent:
     def __init__(self):
-        self.massive_api_key  = os.getenv("MASSIVE_API_KEY")
-        self.db_dsn           = os.getenv("DATABASE_URL")
-        self.massive_base_url = "https://api.massive.com/v2"
-        self.pool             = None
+        self.db_dsn = os.getenv("DATABASE_URL")
+        self.pool   = None
 
         # ── Swing cache (yfinance) ─────────────────────────────────────
         # Warm-up: başlangıçta 60 günlük tam veri çekilir → bellekte tutulur
@@ -44,46 +41,38 @@ class TechnicalAgent:
         return self.pool
 
     # ─────────────────────────────────────────────────────────────────
-    # VERİ ÇEKME — 0DTE (Massive API)
+    # VERİ ÇEKME — 0DTE (yfinance 5m)
     # ─────────────────────────────────────────────────────────────────
-    async def fetch_ohlcv_massive(self, symbol: str, multiplier: str, timespan: str) -> pd.DataFrame:
+    def fetch_ohlcv_5m(self, symbol: str) -> pd.DataFrame:
         """
-        0DTE için Massive API — 5m mumlar, 5 günlük veri.
+        yfinance — 5m mumlar, 5 günlük veri.
         EMA9 + EMA21 için 21 mum yeterli; 5 gün ~390 mum verir.
+        yfinance sync çalışır, asyncio.to_thread ile sarılır.
         """
-        end_date   = datetime.datetime.now(datetime.timezone.utc)
-        start_date = end_date - datetime.timedelta(days=5)
-
-        _to   = end_date.strftime('%Y-%m-%d')
-        _from = start_date.strftime('%Y-%m-%d')
-
-        endpoint = (
-            f"{self.massive_base_url}/aggs/ticker/{symbol}"
-            f"/range/{multiplier}/{timespan}/{_from}/{_to}"
-        )
-        headers = {"Authorization": f"Bearer {self.massive_api_key}"}
-
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(endpoint, headers=headers) as response:
-                    if response.status != 200:
-                        logger.warning(f"[Massive] {symbol} yanıt kodu {response.status}")
-                        return pd.DataFrame()
-                    data = await response.json()
-                    if 'results' in data and len(data['results']) > 0:
-                        df = pd.DataFrame(data['results'])
-                        df = df.rename(columns={
-                            'v': 'volume', 'o': 'open', 'c': 'close',
-                            'h': 'high',   'l': 'low',  't': 'timestamp'
-                        })
-                        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-                        df = df.sort_values('timestamp').reset_index(drop=True)
-                        logger.info(f"✅ [Massive] {symbol} {multiplier}{timespan} — {len(df)} mum")
-                        return df
-                    logger.warning(f"⚠️ [Massive] {symbol} sonuç boş.")
-                    return pd.DataFrame()
+            ticker = yf.Ticker(symbol)
+            df_raw = ticker.history(period="5d", interval="5m")
+
+            if df_raw.empty:
+                logger.warning(f"[yfinance 5m] {symbol} veri boş döndü.")
+                return pd.DataFrame()
+
+            df = df_raw.reset_index().rename(columns={
+                "Datetime": "timestamp",
+                "Open":     "open",
+                "High":     "high",
+                "Low":      "low",
+                "Close":    "close",
+                "Volume":   "volume",
+            })[["timestamp", "open", "high", "low", "close", "volume"]]
+
+            df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
+            df = df.sort_values("timestamp").reset_index(drop=True)
+
+            logger.info(f"✅ [yfinance 5m] {symbol} — {len(df)} mum")
+            return df
         except Exception as e:
-            logger.error(f"[Massive] Veri çekme hatası ({symbol}): {e}")
+            logger.error(f"[yfinance 5m] Veri çekme hatası ({symbol}): {e}")
             return pd.DataFrame()
 
     # ─────────────────────────────────────────────────────────────────
@@ -497,8 +486,8 @@ class TechnicalAgent:
     # ANALİZ ÇALIŞTIRICI
     # ─────────────────────────────────────────────────────────────────
     async def run_0dte(self, symbol: str):
-        """0DTE: Massive'den 5m veri çek → hesapla → kaydet."""
-        df = await self.fetch_ohlcv_massive(symbol, "5", "minute")
+        """0DTE: yfinance'dan 5m veri çek → hesapla → kaydet."""
+        df = await asyncio.to_thread(self.fetch_ohlcv_5m, symbol)
         if df.empty:
             return
 
@@ -541,7 +530,7 @@ class TechnicalAgent:
     # ─────────────────────────────────────────────────────────────────
     async def run_scheduler(self):
         logger.info("🚀 TechnicalAgent başlatıldı. SPY & QQQ takibi aktif.")
-        logger.info("   0DTE  → Massive API (5m, her 5 dakika)")
+        logger.info("   0DTE  → yfinance   (5m, her 5 dakika)")
         logger.info("   Swing → yfinance   (30m, cache, 27. ve 57. dakika)")
 
         await self.ensure_tables()
