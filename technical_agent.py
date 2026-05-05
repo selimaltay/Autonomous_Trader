@@ -418,7 +418,7 @@ class TechnicalAgent:
     async def ensure_tables(self):
         pool = await self.get_pool()
         async with pool.acquire() as conn:
-            for table, default_mode in [("signals_0dte", "0dte"), ("signals_swing", "swing")]:
+            for table, default_mode in [("technical_0dte", "0dte"), ("technical_swing", "swing")]:
                 await conn.execute(f'''
                     CREATE TABLE IF NOT EXISTS {table} (
                         id               SERIAL PRIMARY KEY,
@@ -451,7 +451,7 @@ class TechnicalAgent:
             'fib_yakin_fiyat': 'NUMERIC(10,2)',
         }
         async with pool.acquire() as conn:
-            for table in ['signals_0dte', 'signals_swing']:
+            for table in ['technical_0dte', 'technical_swing']:
                 for col, typ in numeric_cols.items():
                     try:
                         await conn.execute(
@@ -465,7 +465,7 @@ class TechnicalAgent:
     async def save_to_db(self, symbol: str, timeframe: str, data: dict, mode: str = "0dte"):
         if not data:
             return
-        table = "signals_0dte" if mode == "0dte" else "signals_swing"
+        table = "technical_0dte" if mode == "0dte" else "technical_swing"
         try:
             # Precision: tüm numeric alanları kayıt öncesi round'la
             def r2(v): return round(float(v), 2) if v is not None else None
@@ -501,6 +501,16 @@ class TechnicalAgent:
         df = await self.fetch_ohlcv_massive(symbol, "5", "minute")
         if df.empty:
             return
+
+        # Piyasa kapalı kontrolü — son mum 15 dk'dan eskiyse yazma
+        son_mum = df['timestamp'].iloc[-1]
+        if son_mum.tzinfo is None:
+            son_mum = son_mum.tz_localize('UTC')
+        fark = (pd.Timestamp.now(tz='UTC') - son_mum).total_seconds() / 60
+        if fark > 15:
+            logger.info(f"⏸️ [0DTE] {symbol} son mum {round(fark)} dk önce — piyasa kapalı, atlanıyor.")
+            return
+
         data = await self.calculate_indicators(df, mode="0dte")
         await self.save_to_db(symbol, "5m", data, mode="0dte")
 
@@ -508,10 +518,21 @@ class TechnicalAgent:
         """
         Swing: yfinance cache'den 30m veri al → hesapla → kaydet.
         İlk çağrıda warm-up (60 gün), sonrası incremental (2 gün).
+        30m mum + 30dk scheduler = max 60dk tolerans.
         """
         df = await self.get_swing_df(symbol)
         if df.empty:
             return
+
+        # Piyasa kapalı kontrolü — son mum 60 dk'dan eskiyse yazma
+        son_mum = df['timestamp'].iloc[-1]
+        if son_mum.tzinfo is None:
+            son_mum = son_mum.tz_localize('UTC')
+        fark = (pd.Timestamp.now(tz='UTC') - son_mum).total_seconds() / 60
+        if fark > 60:
+            logger.info(f"⏸️ [SWING] {symbol} son mum {round(fark)} dk önce — piyasa kapalı, atlanıyor.")
+            return
+
         data = await self.calculate_indicators(df, mode="swing")
         await self.save_to_db(symbol, "30m", data, mode="swing")
 
