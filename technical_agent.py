@@ -2,577 +2,472 @@ import asyncio
 import datetime
 import logging
 import os
+import json
+
 import asyncpg
 import pandas as pd
 import yfinance as yf
 import ta
-import json
 from dotenv import load_dotenv
 
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger("TechnicalAgent")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SABITLER
+# ─────────────────────────────────────────────────────────────────────────────
+SYMBOLS        = ["SPY", "QQQ"]
+TABLE_0DTE     = "technical_0dte"
+TABLE_SWING    = "technical_swing"
 
+# Scheduler dakikaları
+MINUTES_0DTE   = [3, 8, 13, 18, 23, 28, 33, 38, 43, 48, 53, 58]   # Her 5 dk
+MINUTES_SWING  = [27, 57]                                            # n8n'den 3 dk önce
+
+# Piyasa kapalı eşikleri
+STALE_0DTE_MIN  = 15   # 5m için: son mum 15 dk'dan eskiyse atla
+STALE_SWING_MIN = 65   # 30m için: son mum 65 dk'dan eskiyse atla
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AGENT
+# ─────────────────────────────────────────────────────────────────────────────
 class TechnicalAgent:
+
     def __init__(self):
         self.db_dsn = os.getenv("DATABASE_URL")
-        self.pool   = None
+        if not self.db_dsn:
+            raise RuntimeError("DATABASE_URL ortam değişkeni tanımlı değil!")
+        self.pool = None
 
-        # ── Swing cache (yfinance) ─────────────────────────────────────
-        # Warm-up: başlangıçta 60 günlük tam veri çekilir → bellekte tutulur
-        # Incremental: her 30 dakikada sadece son 2 günlük veri çekilir → eklenir
-        # yfinance ücretsiz, limit yok, 30m için 60 gün geçmiş veri verir
+        # Swing cache: {symbol: DataFrame}
         self._swing_cache: dict[str, pd.DataFrame] = {}
         self._swing_warmup_done: set[str]           = set()
 
-    # ─────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # DB POOL
-    # ─────────────────────────────────────────────────────────────────
-    async def get_pool(self):
+    # ─────────────────────────────────────────────────────────────────────────
+    async def get_pool(self) -> asyncpg.Pool:
         if not self.pool:
             self.pool = await asyncpg.create_pool(
                 self.db_dsn,
                 min_size=2,
                 max_size=5,
-                command_timeout=30
+                command_timeout=30,
             )
         return self.pool
 
-    # ─────────────────────────────────────────────────────────────────
-    # VERİ ÇEKME — 0DTE (yfinance 5m)
-    # ─────────────────────────────────────────────────────────────────
-    def fetch_ohlcv_5m(self, symbol: str) -> pd.DataFrame:
+    # ─────────────────────────────────────────────────────────────────────────
+    # TABLO OLUŞTUR
+    # ─────────────────────────────────────────────────────────────────────────
+    async def ensure_tables(self):
+        pool = await self.get_pool()
+        ddl = """
+            CREATE TABLE IF NOT EXISTS {table} (
+                id               SERIAL PRIMARY KEY,
+                timestamp        TIMESTAMPTZ DEFAULT NOW(),
+                symbol           TEXT        NOT NULL,
+                timeframe        TEXT        NOT NULL,
+                mode             TEXT        NOT NULL,
+                price            NUMERIC(10,2),
+                rsi              NUMERIC(6,2),
+                trend            TEXT,
+                formation        TEXT,
+                divergence       TEXT,
+                fib_swing_high   NUMERIC(10,2),
+                fib_swing_low    NUMERIC(10,2),
+                fib_yakin_seviye TEXT,
+                fib_yakin_fiyat  NUMERIC(10,2),
+                fib_data         JSONB
+            );
+            CREATE INDEX IF NOT EXISTS idx_{safe}_sym_ts
+                ON {table}(symbol, timestamp DESC);
         """
-        yfinance — 5m mumlar, 5 günlük veri.
-        EMA9 + EMA21 için 21 mum yeterli; 5 gün ~390 mum verir.
-        yfinance sync çalışır, asyncio.to_thread ile sarılır.
-        """
-        try:
-            ticker = yf.Ticker(symbol)
-            df_raw = ticker.history(period="5d", interval="5m")
+        async with pool.acquire() as conn:
+            for table in [TABLE_0DTE, TABLE_SWING]:
+                safe = table.replace("-", "_")
+                await conn.execute(ddl.format(table=table, safe=safe))
+        logger.info(f"✅ Tablolar hazır: {TABLE_0DTE}, {TABLE_SWING}")
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # VERİ ÇEKME
+    # ─────────────────────────────────────────────────────────────────────────
+    def _fetch_yfinance(self, symbol: str, interval: str, period: str) -> pd.DataFrame:
+        """yfinance'dan ham veri çek, timezone'u UTC'ye normalize et."""
+        try:
+            df_raw = yf.Ticker(symbol).history(period=period, interval=interval)
             if df_raw.empty:
-                logger.warning(f"[yfinance 5m] {symbol} veri boş döndü.")
+                logger.warning(f"[yfinance] {symbol} {interval} boş döndü.")
                 return pd.DataFrame()
 
-            df = df_raw.reset_index().rename(columns={
-                "Datetime": "timestamp",
-                "Open":     "open",
-                "High":     "high",
-                "Low":      "low",
-                "Close":    "close",
-                "Volume":   "volume",
-            })[["timestamp", "open", "high", "low", "close", "volume"]]
-
-            df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
-            df = df.sort_values("timestamp").reset_index(drop=True)
-
-            logger.info(f"✅ [yfinance 5m] {symbol} — {len(df)} mum")
-            return df
-        except Exception as e:
-            logger.error(f"[yfinance 5m] Veri çekme hatası ({symbol}): {e}")
-            return pd.DataFrame()
-
-    # ─────────────────────────────────────────────────────────────────
-    # VERİ ÇEKME — SWING (yfinance)
-    # ─────────────────────────────────────────────────────────────────
-    def fetch_ohlcv_yfinance(self, symbol: str, period: str = "60d") -> pd.DataFrame:
-        """
-        yfinance — 30m mumlar, ücretsiz, limit yok.
-        period="60d" → warm-up  (~780 mum, SMA200 için yeterli)
-        period="2d"  → incremental (son 2 gün, overlap için +1 gün tampon)
-        Not: yfinance sync çalışır, asyncio.to_thread ile sarılır.
-        """
-        try:
-            ticker = yf.Ticker(symbol)
-            df_raw = ticker.history(period=period, interval="30m")
-
-            if df_raw.empty:
-                logger.warning(f"[yfinance] {symbol} veri boş döndü.")
-                return pd.DataFrame()
-
-            df = df_raw.reset_index().rename(columns={
-                "Datetime": "timestamp",
-                "Open":     "open",
-                "High":     "high",
-                "Low":      "low",
-                "Close":    "close",
-                "Volume":   "volume",
-            })[[ "timestamp", "open", "high", "low", "close", "volume"]]
-
-            # Timezone bilgisini kaldır (asyncpg için)
-            df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize(None)
-            df = df.sort_values("timestamp").reset_index(drop=True)
-
-            gun_sayisi = (df["timestamp"].iloc[-1] - df["timestamp"].iloc[0]).days + 1
-            gunluk_ort = round(len(df) / max(gun_sayisi, 1), 1)
-            logger.info(
-                f"✅ [yfinance] {symbol} 30m — {len(df)} mum | "
-                f"{gun_sayisi} gün | ort {gunluk_ort} mum/gün"
+            df = (
+                df_raw
+                .reset_index()
+                .rename(columns={
+                    "Datetime": "timestamp",
+                    "Date":     "timestamp",
+                    "Open":     "open",
+                    "High":     "high",
+                    "Low":      "low",
+                    "Close":    "close",
+                    "Volume":   "volume",
+                })[["timestamp", "open", "high", "low", "close", "volume"]]
             )
+
+            # Timestamp'i UTC'ye çevir, sonra timezone bilgisini kaldır
+            df["timestamp"] = pd.to_datetime(df["timestamp"])
+            if df["timestamp"].dt.tz is not None:
+                df["timestamp"] = df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
+            else:
+                df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_localize(None)
+
+            df = df.sort_values("timestamp").reset_index(drop=True)
+            logger.info(f"✅ [yfinance] {symbol} {interval} — {len(df)} mum")
             return df
+
         except Exception as e:
-            logger.error(f"[yfinance] Veri çekme hatası ({symbol}): {e}")
+            logger.error(f"[yfinance] Hata ({symbol} {interval}): {e}")
             return pd.DataFrame()
 
-    # ─────────────────────────────────────────────────────────────────
-    # SWING CACHE YÖNETİMİ
-    # ─────────────────────────────────────────────────────────────────
+    def fetch_5m(self, symbol: str) -> pd.DataFrame:
+        return self._fetch_yfinance(symbol, interval="5m", period="5d")
+
+    def fetch_30m(self, symbol: str, period: str = "60d") -> pd.DataFrame:
+        return self._fetch_yfinance(symbol, interval="30m", period=period)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # SWING CACHE
+    # ─────────────────────────────────────────────────────────────────────────
     async def get_swing_df(self, symbol: str) -> pd.DataFrame:
-        """
-        İlk çağrıda  : 60 günlük tam veri → cache'e yaz (warm-up)
-        Sonraki çağrı: son 2 günlük veri  → cache'e ekle (incremental)
-        yfinance sync olduğu için asyncio.to_thread ile çalıştırılır.
-        Duplicate mumları temizle, cache'i son 400 mumla sınırla.
-        """
         if symbol not in self._swing_warmup_done:
-            # ── WARM-UP ───────────────────────────────────────────────
-            logger.info(f"🔄 [Cache] {symbol} warm-up başlıyor (60 gün)...")
-            df = await asyncio.to_thread(self.fetch_ohlcv_yfinance, symbol, "60d")
+            logger.info(f"🔄 [Cache] {symbol} warm-up (60 gün)...")
+            df = await asyncio.to_thread(self.fetch_30m, symbol, "60d")
             if df.empty:
                 logger.error(f"❌ [Cache] {symbol} warm-up başarısız.")
                 return pd.DataFrame()
             self._swing_cache[symbol] = df
             self._swing_warmup_done.add(symbol)
-            logger.info(f"✅ [Cache] {symbol} warm-up tamamlandı — {len(df)} mum bellekte.")
-
+            logger.info(f"✅ [Cache] {symbol} — {len(df)} mum bellekte.")
         else:
-            # ── INCREMENTAL ───────────────────────────────────────────
-            yeni_df = await asyncio.to_thread(self.fetch_ohlcv_yfinance, symbol, "2d")
-            if not yeni_df.empty:
-                mevcut   = self._swing_cache.get(symbol, pd.DataFrame())
-                combined = pd.concat([mevcut, yeni_df], ignore_index=True)
-
-                # Duplicate timestamp temizle (son değeri koru)
+            yeni = await asyncio.to_thread(self.fetch_30m, symbol, "2d")
+            if not yeni.empty:
                 combined = (
-                    combined
+                    pd.concat([self._swing_cache.get(symbol, pd.DataFrame()), yeni])
                     .drop_duplicates(subset="timestamp", keep="last")
                     .sort_values("timestamp")
+                    .tail(400)
                     .reset_index(drop=True)
                 )
-
-                # Bellek tasarrufu: son 400 mum (SMA200 × 2 tampon)
-                if len(combined) > 400:
-                    combined = combined.tail(400).reset_index(drop=True)
-
                 self._swing_cache[symbol] = combined
-                logger.info(
-                    f"🔁 [Cache] {symbol} güncellendi — "
-                    f"toplam {len(combined)} mum (incremental +{len(yeni_df)})"
-                )
+                logger.info(f"🔁 [Cache] {symbol} güncellendi — {len(combined)} mum.")
 
         return self._swing_cache.get(symbol, pd.DataFrame())
 
-    # ─────────────────────────────────────────────────────────────────
-    # TREND TESPİTİ
-    # ─────────────────────────────────────────────────────────────────
-    def detect_trend(self, df: pd.DataFrame, mode: str = "0dte") -> str:
-        """
-        0DTE (5m)  : EMA9 + EMA21 — intraday momentum
-        Swing (30m): EMA21 + SMA50 + SMA200 (SMA200 yoksa iki katmanlı çalışır)
-        """
-        close = df['close']
+    # ─────────────────────────────────────────────────────────────────────────
+    # PIYASA KAPALI KONTROLÜ
+    # ─────────────────────────────────────────────────────────────────────────
+    def _is_stale(self, df: pd.DataFrame, max_minutes: int, symbol: str, mode: str) -> bool:
+        """Son mumun kaç dakika önce olduğunu hesapla, eşiği geçtiyse True döndür."""
+        son_mum = df["timestamp"].iloc[-1]
+        # tz-naive UTC olarak saklandı, now() ile karşılaştır
+        simdi = datetime.datetime.utcnow()
+        fark  = (simdi - son_mum).total_seconds() / 60
+        if fark > max_minutes:
+            logger.info(
+                f"⏸️ [{mode.upper()}] {symbol} son mum {round(fark)} dk önce "
+                f"(eşik: {max_minutes} dk) — piyasa kapalı, atlanıyor."
+            )
+            return True
+        return False
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # TREND
+    # ─────────────────────────────────────────────────────────────────────────
+    def detect_trend(self, df: pd.DataFrame, mode: str) -> str:
+        close = df["close"]
 
         if mode == "0dte":
             if len(df) < 21:
                 return "VERİ_YETERSİZ"
-            ema9   = ta.trend.ema_indicator(close, window=9)
-            ema21  = ta.trend.ema_indicator(close, window=21)
-            curr_p = close.iloc[-1]
-            e9, e21 = ema9.iloc[-1], ema21.iloc[-1]
-
-            if curr_p > e9 > e21:    return "BOGA_GUÇLU"
-            elif curr_p > e9:        return "BOGA_ZAYIF"
-            elif curr_p < e9 < e21:  return "AYI_GUÇLU"
-            elif curr_p < e9:        return "AYI_ZAYIF"
+            e9  = ta.trend.ema_indicator(close, window=9).iloc[-1]
+            e21 = ta.trend.ema_indicator(close, window=21).iloc[-1]
+            p   = close.iloc[-1]
+            if p > e9 > e21:   return "BOGA_GUÇLU"
+            elif p > e9:       return "BOGA_ZAYIF"
+            elif p < e9 < e21: return "AYI_GUÇLU"
+            elif p < e9:       return "AYI_ZAYIF"
             return "YATAY"
 
-        else:  # swing — 30m
+        else:  # swing
             if len(df) < 50:
                 return "VERİ_YETERSİZ"
-
-            ema21  = ta.trend.ema_indicator(close, window=21)
-            sma50  = ta.trend.sma_indicator(close, window=50)
-            curr_p = close.iloc[-1]
-            e21, s50 = ema21.iloc[-1], sma50.iloc[-1]
-
+            e21 = ta.trend.ema_indicator(close, window=21).iloc[-1]
+            s50 = ta.trend.sma_indicator(close, window=50).iloc[-1]
+            p   = close.iloc[-1]
             s200 = None
             if len(df) >= 200:
                 s200 = ta.trend.sma_indicator(close, window=200).iloc[-1]
 
             if s200 is not None:
-                if curr_p > e21 > s50 > s200:    return "BOGA_GUÇLU"
-                elif curr_p > e21 and e21 > s50:  return "BOGA_ORTA"
-                elif curr_p > e21:                return "BOGA_ZAYIF"
-                elif curr_p < e21 < s50 < s200:   return "AYI_GUÇLU"
-                elif curr_p < e21 and e21 < s50:  return "AYI_ORTA"
-                elif curr_p < e21:                return "AYI_ZAYIF"
+                if p > e21 > s50 > s200:   return "BOGA_GUÇLU"
+                elif p > e21 and e21 > s50: return "BOGA_ORTA"
+                elif p > e21:              return "BOGA_ZAYIF"
+                elif p < e21 < s50 < s200: return "AYI_GUÇLU"
+                elif p < e21 and e21 < s50: return "AYI_ORTA"
+                elif p < e21:              return "AYI_ZAYIF"
             else:
-                if curr_p > e21 > s50:    return "BOGA_GUÇLU"
-                elif curr_p > e21:        return "BOGA_ZAYIF"
-                elif curr_p < e21 < s50:  return "AYI_GUÇLU"
-                elif curr_p < e21:        return "AYI_ZAYIF"
-
+                if p > e21 > s50:   return "BOGA_GUÇLU"
+                elif p > e21:       return "BOGA_ZAYIF"
+                elif p < e21 < s50: return "AYI_GUÇLU"
+                elif p < e21:       return "AYI_ZAYIF"
             return "YATAY"
 
-    # ─────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # FİBONACCİ
-    # ─────────────────────────────────────────────────────────────────
-    def calculate_fibonacci(self, df: pd.DataFrame, mode: str = "0dte") -> dict:
-        """
-        0DTE  → son 50 mum  (5m  × 50 = ~4 saatlik intraday swing)
-        Swing → son 100 mum (30m × 100 = ~2 iş günü)
-        Oranlar: Standart retracement + Gartley/Bat/Crab uzantıları
-        """
+    # ─────────────────────────────────────────────────────────────────────────
+    FIB_RATIOS = {
+        "Fib_1.000":  1.000, "Fib_0.886":  0.886, "Fib_0.807":  0.807,
+        "Fib_0.786":  0.786, "Fib_0.707":  0.707, "Fib_0.618":  0.618,
+        "Fib_0.500":  0.500, "Fib_0.382":  0.382, "Fib_0.214":  0.214,
+        "Fib_0.000":  0.000, "Fib_-0.118": -0.118, "Fib_-0.216": -0.216,
+        "Fib_-0.270": -0.270,"Fib_-0.414": -0.414, "Fib_-0.618": -0.618,
+        "Fib_-0.786": -0.786,"Fib_-1.000": -1.000,
+    }
+
+    def calculate_fibonacci(self, df: pd.DataFrame, mode: str) -> dict:
         lookback = 50 if mode == "0dte" else 100
         recent   = df.tail(lookback)
-
-        hi   = recent['high'].max()
-        lo   = recent['low'].min()
-        diff = hi - lo
+        hi, lo   = recent["high"].max(), recent["low"].min()
+        diff     = hi - lo
 
         if diff == 0:
             return {}
 
-        ratios = {
-            "Fib_1.000":   1.000,
-            "Fib_0.886":   0.886,
-            "Fib_0.807":   0.807,
-            "Fib_0.786":   0.786,
-            "Fib_0.707":   0.707,
-            "Fib_0.618":   0.618,
-            "Fib_0.500":   0.500,
-            "Fib_0.382":   0.382,
-            "Fib_0.214":   0.214,
-            "Fib_0.000":   0.000,
-            "Fib_-0.118": -0.118,
-            "Fib_-0.216": -0.216,
-            "Fib_-0.270": -0.270,
-            "Fib_-0.414": -0.414,
-            "Fib_-0.618": -0.618,
-            "Fib_-0.786": -0.786,
-            "Fib_-1.000": -1.000,
-        }
+        fibs = dict(sorted(
+            {label: round(hi - diff * r, 2) for label, r in self.FIB_RATIOS.items()}.items(),
+            key=lambda x: x[1], reverse=True
+        ))
 
-        fibs_raw = {label: round(hi - (diff * r), 2) for label, r in ratios.items()}
-        # Fiyat sırasına göre büyükten küçüğe sırala (swing high → swing low → uzantılar)
-        fibs = dict(sorted(fibs_raw.items(), key=lambda x: x[1], reverse=True))
-        curr_price                = df['close'].iloc[-1]
-        yakin_seviye, yakin_fiyat = self._fib_proximity(curr_price, fibs)
+        curr   = df["close"].iloc[-1]
+        yakin_seviye, yakin_fiyat = None, None
+        for label, level in fibs.items():
+            if level > 0 and abs(curr - level) / level < 0.003:
+                yakin_seviye, yakin_fiyat = label, level
+                break
 
         return {
             "swing_high":   round(hi, 2),
             "swing_low":    round(lo, 2),
-            "lookback_mum": lookback,
             "seviyeler":    fibs,
             "yakin_seviye": yakin_seviye,
             "yakin_fiyat":  yakin_fiyat,
         }
 
-    def _fib_proximity(self, price: float, fibs: dict, tolerance: float = 0.003) -> tuple:
-        """Fiyatın %0.3 yakınındaki Fib seviyesini döndürür."""
-        for label, level in fibs.items():
-            if level > 0 and abs(price - level) / level < tolerance:
-                return label, level
-        return None, None
-
-    # ─────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # MUM FORMASYONLARI
-    # ─────────────────────────────────────────────────────────────────
-    def detect_candle_patterns(self, df: pd.DataFrame, mode: str = "0dte") -> str:
+    # ─────────────────────────────────────────────────────────────────────────
+    def detect_candle(self, df: pd.DataFrame) -> str:
         if len(df) < 3:
             return "VERİ_YETERSİZ"
 
         prev = df.iloc[-2]
         curr = df.iloc[-1]
-
-        body       = abs(curr['close'] - curr['open'])
-        wick_total = curr['high'] - curr['low']
-        upper_wick = curr['high'] - max(curr['open'], curr['close'])
-        lower_wick = min(curr['open'], curr['close']) - curr['low']
-        avg_body   = df['close'].diff().abs().mean()
+        body       = abs(curr["close"] - curr["open"])
+        wick_total = curr["high"] - curr["low"]
+        upper_wick = curr["high"] - max(curr["open"], curr["close"])
+        lower_wick = min(curr["open"], curr["close"]) - curr["low"]
+        avg_body   = df["close"].diff().abs().mean()
 
         if wick_total == 0:
             return "NORMAL"
-
-        if (body / wick_total) < 0.1:
+        if body / wick_total < 0.1:
             return "DOJI"
-
         if body > avg_body * 2 and upper_wick < body * 0.1 and lower_wick < body * 0.1:
             return "MARUBOZU"
-
         if lower_wick > body * 2 and upper_wick < body * 0.5:
             return "CEKIC"
-
         if upper_wick > body * 2 and lower_wick < body * 0.5:
             return "KAYAN_YILDIZ"
-
-        if (curr['close'] > curr['open']
-                and prev['close'] < prev['open']
-                and curr['close'] > prev['open']
-                and curr['open']  < prev['close']):
+        if (curr["close"] > curr["open"]
+                and prev["close"] < prev["open"]
+                and curr["close"] > prev["open"]
+                and curr["open"]  < prev["close"]):
             return "YUTAN_BOGA"
-
-        if (curr['close'] < curr['open']
-                and prev['close'] > prev['open']
-                and curr['close'] < prev['open']
-                and curr['open']  > prev['close']):
+        if (curr["close"] < curr["open"]
+                and prev["close"] > prev["open"]
+                and curr["close"] < prev["open"]
+                and curr["open"]  > prev["close"]):
             return "YUTAN_AYI"
-
         return "NORMAL"
 
-    # ─────────────────────────────────────────────────────────────────
-    # RSI UYUMSUZLUK
-    # ─────────────────────────────────────────────────────────────────
-    def check_rsi_divergence(self, df: pd.DataFrame, mode: str = "0dte") -> str:
-        """
-        0DTE: 14 mum geriye — kısa vadeli
-        Swing: 30 mum geriye — daha güvenilir
-        """
+    # ─────────────────────────────────────────────────────────────────────────
+    # RSI DİVERJANS
+    # ─────────────────────────────────────────────────────────────────────────
+    def check_divergence(self, df: pd.DataFrame, mode: str) -> str:
         lookback = 14 if mode == "0dte" else 30
-
-        if len(df) < lookback + 2 or 'RSI' not in df.columns:
+        if len(df) < lookback + 2 or "RSI" not in df.columns:
             return "YOK"
 
-        window   = df.tail(lookback)
-        prices   = window['close'].values
-        rsi_vals = window['RSI'].values
-        mid      = lookback // 2
+        w      = df.tail(lookback)
+        prices = w["close"].values
+        rsi    = w["RSI"].values
+        mid    = lookback // 2
 
-        # Bullish: fiyat lower low, RSI higher low
-        if (prices[mid:].min() < prices[:mid].min()
-                and rsi_vals[mid + prices[mid:].argmin()] > rsi_vals[prices[:mid].argmin()]):
+        p_first, p_second = prices[:mid], prices[mid:]
+        r_first, r_second = rsi[:mid],    rsi[mid:]
+
+        # Bullish divergence: fiyat lower low, RSI higher low
+        if (p_second.min() < p_first.min()
+                and r_second[p_second.argmin()] > r_first[p_first.argmin()]):
             return "POZITIF"
 
-        # Bearish: fiyat higher high, RSI lower high
-        if (prices[mid:].max() > prices[:mid].max()
-                and rsi_vals[mid + prices[mid:].argmax()] < rsi_vals[prices[:mid].argmax()]):
+        # Bearish divergence: fiyat higher high, RSI lower high
+        if (p_second.max() > p_first.max()
+                and r_second[p_second.argmax()] < r_first[p_first.argmax()]):
             return "NEGATIF"
 
         return "YOK"
 
-    # ─────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # ANA HESAPLAMA
-    # ─────────────────────────────────────────────────────────────────
-    async def calculate_indicators(self, df: pd.DataFrame, mode: str = "0dte") -> dict | None:
+    # ─────────────────────────────────────────────────────────────────────────
+    async def calculate(self, df: pd.DataFrame, mode: str) -> dict | None:
         min_rows = 21 if mode == "0dte" else 50
         if df.empty or len(df) < min_rows:
-            logger.warning(f"Yetersiz veri: {len(df)} mum ({mode} için min {min_rows})")
+            logger.warning(f"⚠️ Yetersiz veri: {len(df)} mum (min {min_rows})")
             return None
 
         try:
-            df        = df.copy()
-            df['RSI'] = ta.momentum.rsi(df['close'], window=14)
+            df = df.copy()
+            df["RSI"] = ta.momentum.rsi(df["close"], window=14)
 
-            trend      = self.detect_trend(df, mode)
-            formation  = self.detect_candle_patterns(df, mode)
-            divergence = self.check_rsi_divergence(df, mode)
-            fib        = self.calculate_fibonacci(df, mode)
-
-            curr_price = round(float(df['close'].iloc[-1]), 2)
-            curr_rsi   = round(float(df['RSI'].iloc[-1]),   2)
-
-            fib_yakin_fiyat = fib.get("yakin_fiyat")
+            trend     = self.detect_trend(df, mode)
+            formation = self.detect_candle(df)
+            divergence= self.check_divergence(df, mode)
+            fib       = self.calculate_fibonacci(df, mode)
 
             result = {
                 "mode":             mode,
-                "price":            curr_price,
-                "rsi":              curr_rsi,
+                "price":            round(float(df["close"].iloc[-1]), 2),
+                "rsi":              round(float(df["RSI"].iloc[-1]),   2),
                 "trend":            trend,
                 "formation":        formation,
                 "divergence":       divergence,
-                "fib_swing_high":   round(float(fib.get("swing_high", 0) or 0), 2) or None,
-                "fib_swing_low":    round(float(fib.get("swing_low",  0) or 0), 2) or None,
+                "fib_swing_high":   round(float(fib["swing_high"]), 2) if fib.get("swing_high") else None,
+                "fib_swing_low":    round(float(fib["swing_low"]),  2) if fib.get("swing_low")  else None,
                 "fib_yakin_seviye": fib.get("yakin_seviye"),
-                "fib_yakin_fiyat":  round(float(fib_yakin_fiyat), 2) if fib_yakin_fiyat else None,
+                "fib_yakin_fiyat":  round(float(fib["yakin_fiyat"]), 2) if fib.get("yakin_fiyat") else None,
                 "fib_data":         fib.get("seviyeler", {}),
             }
 
             logger.info(
-                f"📊 [{mode.upper()}] {curr_price} | RSI {curr_rsi} | "
-                f"Trend: {trend} | Form: {formation} | "
-                f"Div: {divergence} | Fib: {fib.get('yakin_seviye', '-')}"
+                f"📊 [{mode.upper()}] {result['price']} | RSI {result['rsi']} | "
+                f"Trend: {trend} | Form: {formation} | Div: {divergence} | "
+                f"Fib: {fib.get('yakin_seviye', '-')}"
             )
             return result
 
         except Exception as e:
-            logger.error(f"Hesaplama hatası ({mode}): {e}")
+            logger.error(f"❌ Hesaplama hatası ({mode}): {e}")
             return None
 
-    # ─────────────────────────────────────────────────────────────────
-    # DB
-    # ─────────────────────────────────────────────────────────────────
-    async def ensure_tables(self):
-        pool = await self.get_pool()
-        async with pool.acquire() as conn:
-            for table, default_mode in [("technical_0dte", "0dte"), ("technical_swing", "swing")]:
-                await conn.execute(f'''
-                    CREATE TABLE IF NOT EXISTS {table} (
-                        id               SERIAL PRIMARY KEY,
-                        timestamp        TIMESTAMPTZ DEFAULT NOW(),
-                        symbol           TEXT NOT NULL,
-                        timeframe        TEXT NOT NULL,
-                        mode             TEXT DEFAULT '{default_mode}',
-                        price            NUMERIC(10,2),
-                        rsi              NUMERIC(6,2),
-                        trend            TEXT,
-                        formation        TEXT,
-                        divergence       TEXT,
-                        fib_swing_high   NUMERIC(10,2),
-                        fib_swing_low    NUMERIC(10,2),
-                        fib_yakin_seviye TEXT,
-                        fib_yakin_fiyat  NUMERIC(10,2),
-                        fib_data         JSONB
-                    )
-                ''')
-                await conn.execute(f'''
-                    CREATE INDEX IF NOT EXISTS idx_{table}_symbol_ts
-                    ON {table}(symbol, timestamp DESC)
-                ''')
-        # Mevcut tablolarda eski NUMERIC kolonlarını NUMERIC(10,2)'ye güncelle
-        numeric_cols = {
-            'price':           'NUMERIC(10,2)',
-            'rsi':             'NUMERIC(6,2)',
-            'fib_swing_high':  'NUMERIC(10,2)',
-            'fib_swing_low':   'NUMERIC(10,2)',
-            'fib_yakin_fiyat': 'NUMERIC(10,2)',
-        }
-        async with pool.acquire() as conn:
-            for table in ['technical_0dte', 'technical_swing']:
-                for col, typ in numeric_cols.items():
-                    try:
-                        await conn.execute(
-                            f'ALTER TABLE {table} ALTER COLUMN {col} '
-                            f'TYPE {typ} USING round({col}::numeric, 2)'
-                        )
-                    except Exception:
-                        pass  # Kolon zaten doğru tipteyse sessizce geç
-        logger.info("✅ DB tabloları hazır.")
-
-    async def save_to_db(self, symbol: str, timeframe: str, data: dict, mode: str = "0dte"):
+    # ─────────────────────────────────────────────────────────────────────────
+    # DB KAYIT
+    # ─────────────────────────────────────────────────────────────────────────
+    async def save(self, symbol: str, timeframe: str, data: dict, mode: str):
         if not data:
+            logger.warning(f"⚠️ [{mode.upper()}] {symbol} — kaydedilecek veri yok.")
             return
-        table = "technical_0dte" if mode == "0dte" else "technical_swing"
+
+        table    = TABLE_0DTE if mode == "0dte" else TABLE_SWING
+        fib_data = dict(sorted(
+            data.get("fib_data", {}).items(),
+            key=lambda x: x[1], reverse=True
+        ))
+
+        def r2(v):
+            return round(float(v), 2) if v is not None else None
+
         try:
-            # Precision: tüm numeric alanları kayıt öncesi round'la
-            def r2(v): return round(float(v), 2) if v is not None else None
-
-            # Fib data: fiyat sırasına göre büyükten küçüğe sırala
-            fib_raw  = data.get("fib_data", {})
-            fib_data = dict(sorted(fib_raw.items(), key=lambda x: x[1], reverse=True))
-
             pool = await self.get_pool()
             async with pool.acquire() as conn:
-                await conn.execute(f'''
+                await conn.execute(
+                    f"""
                     INSERT INTO {table}
                         (symbol, timeframe, mode, price, rsi, trend, formation, divergence,
                          fib_swing_high, fib_swing_low, fib_yakin_seviye, fib_yakin_fiyat, fib_data)
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)
-                ''',
+                    """,
                     symbol, timeframe, mode,
-                    r2(data["price"]), r2(data["rsi"]),
-                    data["trend"], data["formation"], data["divergence"],
+                    r2(data["price"]),         r2(data["rsi"]),
+                    data["trend"],             data["formation"],   data["divergence"],
                     r2(data.get("fib_swing_high")), r2(data.get("fib_swing_low")),
-                    data.get("fib_yakin_seviye"), r2(data.get("fib_yakin_fiyat")),
-                    json.dumps(fib_data)
+                    data.get("fib_yakin_seviye"),   r2(data.get("fib_yakin_fiyat")),
+                    json.dumps(fib_data),
                 )
-            logger.info(f"💾 [{mode.upper()}] {symbol} {timeframe} → {table}")
+            logger.info(f"💾 [{mode.upper()}] {symbol} {timeframe} → {table} ✅")
         except Exception as e:
-            logger.error(f"DB kayıt hatası ({symbol} {mode}): {e}")
+            logger.error(f"❌ DB kayıt hatası ({symbol} {mode}): {e}")
 
-    # ─────────────────────────────────────────────────────────────────
-    # ANALİZ ÇALIŞTIRICI
-    # ─────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+    # ÇALIŞTIRICILAR
+    # ─────────────────────────────────────────────────────────────────────────
     async def run_0dte(self, symbol: str):
-        """0DTE: yfinance'dan 5m veri çek → hesapla → kaydet."""
-        df = await asyncio.to_thread(self.fetch_ohlcv_5m, symbol)
+        df = await asyncio.to_thread(self.fetch_5m, symbol)
         if df.empty:
             return
-
-        # Piyasa kapalı kontrolü — son mum 15 dk'dan eskiyse yazma
-        son_mum = df['timestamp'].iloc[-1]
-        if son_mum.tzinfo is None:
-            son_mum = son_mum.tz_localize('UTC')
-        fark = (pd.Timestamp.now(tz='UTC') - son_mum).total_seconds() / 60
-        if fark > 15:
-            logger.info(f"⏸️ [0DTE] {symbol} son mum {round(fark)} dk önce — piyasa kapalı, atlanıyor.")
+        if self._is_stale(df, STALE_0DTE_MIN, symbol, "0dte"):
             return
-
-        data = await self.calculate_indicators(df, mode="0dte")
-        await self.save_to_db(symbol, "5m", data, mode="0dte")
+        data = await self.calculate(df, mode="0dte")
+        await self.save(symbol, "5m", data, mode="0dte")
 
     async def run_swing(self, symbol: str):
-        """
-        Swing: yfinance cache'den 30m veri al → hesapla → kaydet.
-        İlk çağrıda warm-up (60 gün), sonrası incremental (2 gün).
-        30m mum + 30dk scheduler = max 60dk tolerans.
-        """
         df = await self.get_swing_df(symbol)
         if df.empty:
             return
-
-        # Piyasa kapalı kontrolü — son mum 60 dk'dan eskiyse yazma
-        son_mum = df['timestamp'].iloc[-1]
-        if son_mum.tzinfo is None:
-            son_mum = son_mum.tz_localize('UTC')
-        fark = (pd.Timestamp.now(tz='UTC') - son_mum).total_seconds() / 60
-        if fark > 60:
-            logger.info(f"⏸️ [SWING] {symbol} son mum {round(fark)} dk önce — piyasa kapalı, atlanıyor.")
+        if self._is_stale(df, STALE_SWING_MIN, symbol, "swing"):
             return
+        data = await self.calculate(df, mode="swing")
+        await self.save(symbol, "30m", data, mode="swing")
 
-        data = await self.calculate_indicators(df, mode="swing")
-        await self.save_to_db(symbol, "30m", data, mode="swing")
-
-    # ─────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     # SCHEDULER
-    # ─────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
     async def run_scheduler(self):
-        logger.info("🚀 TechnicalAgent başlatıldı. SPY & QQQ takibi aktif.")
-        logger.info("   0DTE  → yfinance   (5m, her 5 dakika)")
-        logger.info("   Swing → yfinance   (30m, cache, 27. ve 57. dakika)")
+        logger.info("🚀 TechnicalAgent başlatıldı.")
+        logger.info(f"   Semboller : {SYMBOLS}")
+        logger.info(f"   0DTE      → {TABLE_0DTE}  | 5m  | dakikalar: {MINUTES_0DTE}")
+        logger.info(f"   Swing     → {TABLE_SWING} | 30m | dakikalar: {MINUTES_SWING}")
 
         await self.ensure_tables()
 
-        # Swing warm-up: başlangıçta hemen çalıştır
+        # Başlangıçta swing warm-up
         logger.info("🔄 Swing warm-up başlatılıyor...")
-        await asyncio.gather(
-            self.run_swing("SPY"),
-            self.run_swing("QQQ"),
-            return_exceptions=True
-        )
+        await asyncio.gather(*[self.run_swing(s) for s in SYMBOLS], return_exceptions=True)
         logger.info("✅ Swing warm-up tamamlandı.")
 
-        # 0DTE: her 5 dakikada bir
-        m_0dte  = [3, 8, 13, 18, 23, 28, 33, 38, 43, 48, 53, 58]
-        # Swing: n8n'den 3 dakika önce
-        m_swing = [27, 57]
-
         last_run = -1
-
         while True:
             now = datetime.datetime.now()
-
             if now.minute != last_run:
                 tasks = []
-                for sym in ["SPY", "QQQ"]:
-                    if now.minute in m_0dte:
+                for sym in SYMBOLS:
+                    if now.minute in MINUTES_0DTE:
                         tasks.append(self.run_0dte(sym))
-                    if now.minute in m_swing:
+                    if now.minute in MINUTES_SWING:
                         tasks.append(self.run_swing(sym))
-
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
-
                 last_run = now.minute
-
             await asyncio.sleep(1)
 
 
-# ─────────────────────────────────────────────────────────────────
-# BAŞLATMA
-# ─────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     agent = TechnicalAgent()
     try:
