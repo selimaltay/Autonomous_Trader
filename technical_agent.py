@@ -34,10 +34,6 @@ SAAT_BITIS     = 24   # 24:00 TSİ
 MINUTES_0DTE   = [3, 8, 13, 18, 23, 28, 33, 38, 43, 48, 53, 58]
 MINUTES_SWING  = [27, 57]
 
-# Piyasa kapalı eşikleri
-STALE_0DTE_MIN  = 15
-STALE_SWING_MIN = 65
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AGENT
@@ -169,25 +165,6 @@ class TechnicalAgent:
                 logger.info(f"🔁 [Cache] {symbol} güncellendi — {len(combined)} mum.")
 
         return self._swing_cache.get(symbol, pd.DataFrame())
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # PIYASA KAPALI KONTROLÜ
-    # ─────────────────────────────────────────────────────────────────────────
-    def _is_stale(self, df: pd.DataFrame, max_minutes: int, symbol: str, mode: str) -> bool:
-        """
-        Son mumun UTC zamanını now(UTC) ile karşılaştır.
-        df['timestamp'] tz-naive UTC olarak saklanıyor.
-        """
-        son_mum = df["timestamp"].iloc[-1]
-        simdi   = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
-        fark    = (simdi - son_mum).total_seconds() / 60
-        if fark > max_minutes:
-            logger.info(
-                f"⏸️ [{mode.upper()}] {symbol} son mum {round(fark)} dk önce "
-                f"(eşik: {max_minutes} dk) — piyasa kapalı, atlanıyor."
-            )
-            return True
-        return False
 
     # ─────────────────────────────────────────────────────────────────────────
     # TREND
@@ -322,8 +299,8 @@ class TechnicalAgent:
         rsi    = w["RSI"].values
         mid    = lookback // 2
 
-        p_first,  p_second = prices[:mid], prices[mid:]
-        r_first,  r_second = rsi[:mid],    rsi[mid:]
+        p_first, p_second = prices[:mid], prices[mid:]
+        r_first, r_second = rsi[:mid],    rsi[mid:]
 
         if (p_second.min() < p_first.min()
                 and r_second[p_second.argmin()] > r_first[p_first.argmin()]):
@@ -423,16 +400,12 @@ class TechnicalAgent:
         df = await asyncio.to_thread(self.fetch_5m, symbol)
         if df.empty:
             return
-        if self._is_stale(df, STALE_0DTE_MIN, symbol, "0dte"):
-            return
         data = await self.calculate(df, mode="0dte")
         await self.save(symbol, "5m", data, mode="0dte")
 
     async def run_swing(self, symbol: str):
         df = await self.get_swing_df(symbol)
         if df.empty:
-            return
-        if self._is_stale(df, STALE_SWING_MIN, symbol, "swing"):
             return
         data = await self.calculate(df, mode="swing")
         await self.save(symbol, "30m", data, mode="swing")
@@ -457,7 +430,6 @@ class TechnicalAgent:
         saat_disi_log = False
 
         while True:
-            # Saat kontrolü her zaman TSİ (UTC+3) üzerinden yapılır
             now  = datetime.datetime.now(TSI)
             saat = now.hour
 
