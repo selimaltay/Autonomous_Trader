@@ -25,6 +25,10 @@ SYMBOLS        = ["SPY", "QQQ"]
 TABLE_0DTE     = "technical_0dte"
 TABLE_SWING    = "technical_swing"
 
+# Çalışma saatleri (TSİ)
+SAAT_BASLANGIC = 15   # 15:00 TSİ — pre-market öncesi warm-up
+SAAT_BITIS     = 24   # 24:00 TSİ — after-market 1. saat
+
 # Scheduler dakikaları
 MINUTES_0DTE   = [3, 8, 13, 18, 23, 28, 33, 38, 43, 48, 53, 58]   # Her 5 dk
 MINUTES_SWING  = [27, 57]                                            # n8n'den 3 dk önce
@@ -174,9 +178,8 @@ class TechnicalAgent:
     def _is_stale(self, df: pd.DataFrame, max_minutes: int, symbol: str, mode: str) -> bool:
         """Son mumun kaç dakika önce olduğunu hesapla, eşiği geçtiyse True döndür."""
         son_mum = df["timestamp"].iloc[-1]
-        # tz-naive UTC olarak saklandı, now() ile karşılaştır
-        simdi = datetime.datetime.utcnow()
-        fark  = (simdi - son_mum).total_seconds() / 60
+        simdi   = datetime.datetime.utcnow()
+        fark    = (simdi - son_mum).total_seconds() / 60
         if fark > max_minutes:
             logger.info(
                 f"⏸️ [{mode.upper()}] {symbol} son mum {round(fark)} dk önce "
@@ -214,12 +217,12 @@ class TechnicalAgent:
                 s200 = ta.trend.sma_indicator(close, window=200).iloc[-1]
 
             if s200 is not None:
-                if p > e21 > s50 > s200:   return "BOGA_GUÇLU"
+                if p > e21 > s50 > s200:    return "BOGA_GUÇLU"
                 elif p > e21 and e21 > s50: return "BOGA_ORTA"
-                elif p > e21:              return "BOGA_ZAYIF"
-                elif p < e21 < s50 < s200: return "AYI_GUÇLU"
+                elif p > e21:               return "BOGA_ZAYIF"
+                elif p < e21 < s50 < s200:  return "AYI_GUÇLU"
                 elif p < e21 and e21 < s50: return "AYI_ORTA"
-                elif p < e21:              return "AYI_ZAYIF"
+                elif p < e21:               return "AYI_ZAYIF"
             else:
                 if p > e21 > s50:   return "BOGA_GUÇLU"
                 elif p > e21:       return "BOGA_ZAYIF"
@@ -253,7 +256,7 @@ class TechnicalAgent:
             key=lambda x: x[1], reverse=True
         ))
 
-        curr   = df["close"].iloc[-1]
+        curr = df["close"].iloc[-1]
         yakin_seviye, yakin_fiyat = None, None
         for label, level in fibs.items():
             if level > 0 and abs(curr - level) / level < 0.003:
@@ -346,10 +349,10 @@ class TechnicalAgent:
             df = df.copy()
             df["RSI"] = ta.momentum.rsi(df["close"], window=14)
 
-            trend     = self.detect_trend(df, mode)
-            formation = self.detect_candle(df)
-            divergence= self.check_divergence(df, mode)
-            fib       = self.calculate_fibonacci(df, mode)
+            trend      = self.detect_trend(df, mode)
+            formation  = self.detect_candle(df)
+            divergence = self.check_divergence(df, mode)
+            fib        = self.calculate_fibonacci(df, mode)
 
             result = {
                 "mode":             mode,
@@ -404,8 +407,8 @@ class TechnicalAgent:
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)
                     """,
                     symbol, timeframe, mode,
-                    r2(data["price"]),         r2(data["rsi"]),
-                    data["trend"],             data["formation"],   data["divergence"],
+                    r2(data["price"]),              r2(data["rsi"]),
+                    data["trend"],                  data["formation"],   data["divergence"],
                     r2(data.get("fib_swing_high")), r2(data.get("fib_swing_low")),
                     data.get("fib_yakin_seviye"),   r2(data.get("fib_yakin_fiyat")),
                     json.dumps(fib_data),
@@ -440,20 +443,51 @@ class TechnicalAgent:
     # ─────────────────────────────────────────────────────────────────────────
     async def run_scheduler(self):
         logger.info("🚀 TechnicalAgent başlatıldı.")
-        logger.info(f"   Semboller : {SYMBOLS}")
-        logger.info(f"   0DTE      → {TABLE_0DTE}  | 5m  | dakikalar: {MINUTES_0DTE}")
-        logger.info(f"   Swing     → {TABLE_SWING} | 30m | dakikalar: {MINUTES_SWING}")
+        logger.info(f"   Semboller    : {SYMBOLS}")
+        logger.info(f"   Çalışma saati: {SAAT_BASLANGIC}:00 - {SAAT_BITIS}:00 TSİ")
+        logger.info(f"   0DTE  → {TABLE_0DTE}  | 5m  | dakikalar: {MINUTES_0DTE}")
+        logger.info(f"   Swing → {TABLE_SWING} | 30m | dakikalar: {MINUTES_SWING}")
 
         await self.ensure_tables()
 
-        # Başlangıçta swing warm-up
-        logger.info("🔄 Swing warm-up başlatılıyor...")
+        # İlk başlatmada warm-up (saatten bağımsız)
+        logger.info("🔄 Başlangıç warm-up...")
         await asyncio.gather(*[self.run_swing(s) for s in SYMBOLS], return_exceptions=True)
-        logger.info("✅ Swing warm-up tamamlandı.")
+        logger.info("✅ Başlangıç warm-up tamamlandı.")
 
-        last_run = -1
+        last_run        = -1
+        saat_disi_log   = False   # Saat dışı logu bir kez yazdır
+
         while True:
-            now = datetime.datetime.now()
+            now  = datetime.datetime.now()
+            saat = now.hour
+
+            # ── Çalışma saati dışı ───────────────────────────────────
+            if not (SAAT_BASLANGIC <= saat < SAAT_BITIS):
+                if not saat_disi_log:
+                    logger.info(
+                        f"😴 Saat {now.strftime('%H:%M')} — çalışma saati dışında "
+                        f"({SAAT_BASLANGIC}:00-{SAAT_BITIS}:00 TSİ). Bekleniyor..."
+                    )
+                    saat_disi_log = True
+                    last_run      = -99   # Saat aralığına girilince warm-up tetiklensin
+                await asyncio.sleep(30)
+                continue
+
+            # ── Saat aralığına yeni girildi → gün başı warm-up ───────
+            if last_run == -99:
+                logger.info(
+                    f"⏰ Saat {now.strftime('%H:%M')} — çalışma saati başladı, "
+                    f"gün başı warm-up yapılıyor..."
+                )
+                self._swing_warmup_done.clear()
+                self._swing_cache.clear()
+                await asyncio.gather(*[self.run_swing(s) for s in SYMBOLS], return_exceptions=True)
+                logger.info("✅ Gün başı warm-up tamamlandı.")
+                saat_disi_log = False
+                last_run      = -1
+
+            # ── Normal çalışma ────────────────────────────────────────
             if now.minute != last_run:
                 tasks = []
                 for sym in SYMBOLS:
@@ -464,6 +498,7 @@ class TechnicalAgent:
                 if tasks:
                     await asyncio.gather(*tasks, return_exceptions=True)
                 last_run = now.minute
+
             await asyncio.sleep(1)
 
 
