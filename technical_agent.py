@@ -25,17 +25,18 @@ SYMBOLS        = ["SPY", "QQQ"]
 TABLE_0DTE     = "technical_0dte"
 TABLE_SWING    = "technical_swing"
 
-# Çalışma saatleri (TSİ)
-SAAT_BASLANGIC = 15   # 15:00 TSİ — pre-market öncesi warm-up
-SAAT_BITIS     = 24   # 24:00 TSİ — after-market 1. saat
+# Çalışma saatleri (TSİ = UTC+3)
+TSI            = datetime.timezone(datetime.timedelta(hours=3))
+SAAT_BASLANGIC = 15   # 15:00 TSİ
+SAAT_BITIS     = 24   # 24:00 TSİ
 
 # Scheduler dakikaları
-MINUTES_0DTE   = [3, 8, 13, 18, 23, 28, 33, 38, 43, 48, 53, 58]   # Her 5 dk
-MINUTES_SWING  = [27, 57]                                            # n8n'den 3 dk önce
+MINUTES_0DTE   = [3, 8, 13, 18, 23, 28, 33, 38, 43, 48, 53, 58]
+MINUTES_SWING  = [27, 57]
 
 # Piyasa kapalı eşikleri
-STALE_0DTE_MIN  = 15   # 5m için: son mum 15 dk'dan eskiyse atla
-STALE_SWING_MIN = 65   # 30m için: son mum 65 dk'dan eskiyse atla
+STALE_0DTE_MIN  = 15
+STALE_SWING_MIN = 65
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -49,7 +50,6 @@ class TechnicalAgent:
             raise RuntimeError("DATABASE_URL ortam değişkeni tanımlı değil!")
         self.pool = None
 
-        # Swing cache: {symbol: DataFrame}
         self._swing_cache: dict[str, pd.DataFrame] = {}
         self._swing_warmup_done: set[str]           = set()
 
@@ -102,7 +102,6 @@ class TechnicalAgent:
     # VERİ ÇEKME
     # ─────────────────────────────────────────────────────────────────────────
     def _fetch_yfinance(self, symbol: str, interval: str, period: str) -> pd.DataFrame:
-        """yfinance'dan ham veri çek, timezone'u UTC'ye normalize et."""
         try:
             df_raw = yf.Ticker(symbol).history(period=period, interval=interval)
             if df_raw.empty:
@@ -123,7 +122,6 @@ class TechnicalAgent:
                 })[["timestamp", "open", "high", "low", "close", "volume"]]
             )
 
-            # Timestamp'i UTC'ye çevir, sonra timezone bilgisini kaldır
             df["timestamp"] = pd.to_datetime(df["timestamp"])
             if df["timestamp"].dt.tz is not None:
                 df["timestamp"] = df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
@@ -176,9 +174,12 @@ class TechnicalAgent:
     # PIYASA KAPALI KONTROLÜ
     # ─────────────────────────────────────────────────────────────────────────
     def _is_stale(self, df: pd.DataFrame, max_minutes: int, symbol: str, mode: str) -> bool:
-        """Son mumun kaç dakika önce olduğunu hesapla, eşiği geçtiyse True döndür."""
+        """
+        Son mumun UTC zamanını now(UTC) ile karşılaştır.
+        df['timestamp'] tz-naive UTC olarak saklanıyor.
+        """
         son_mum = df["timestamp"].iloc[-1]
-        simdi   = datetime.datetime.utcnow()
+        simdi   = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
         fark    = (simdi - son_mum).total_seconds() / 60
         if fark > max_minutes:
             logger.info(
@@ -209,9 +210,9 @@ class TechnicalAgent:
         else:  # swing
             if len(df) < 50:
                 return "VERİ_YETERSİZ"
-            e21 = ta.trend.ema_indicator(close, window=21).iloc[-1]
-            s50 = ta.trend.sma_indicator(close, window=50).iloc[-1]
-            p   = close.iloc[-1]
+            e21  = ta.trend.ema_indicator(close, window=21).iloc[-1]
+            s50  = ta.trend.sma_indicator(close, window=50).iloc[-1]
+            p    = close.iloc[-1]
             s200 = None
             if len(df) >= 200:
                 s200 = ta.trend.sma_indicator(close, window=200).iloc[-1]
@@ -234,12 +235,12 @@ class TechnicalAgent:
     # FİBONACCİ
     # ─────────────────────────────────────────────────────────────────────────
     FIB_RATIOS = {
-        "Fib_1.000":  1.000, "Fib_0.886":  0.886, "Fib_0.807":  0.807,
-        "Fib_0.786":  0.786, "Fib_0.707":  0.707, "Fib_0.618":  0.618,
-        "Fib_0.500":  0.500, "Fib_0.382":  0.382, "Fib_0.214":  0.214,
-        "Fib_0.000":  0.000, "Fib_-0.118": -0.118, "Fib_-0.216": -0.216,
-        "Fib_-0.270": -0.270,"Fib_-0.414": -0.414, "Fib_-0.618": -0.618,
-        "Fib_-0.786": -0.786,"Fib_-1.000": -1.000,
+        "Fib_1.000":   1.000, "Fib_0.886":  0.886, "Fib_0.807":  0.807,
+        "Fib_0.786":   0.786, "Fib_0.707":  0.707, "Fib_0.618":  0.618,
+        "Fib_0.500":   0.500, "Fib_0.382":  0.382, "Fib_0.214":  0.214,
+        "Fib_0.000":   0.000, "Fib_-0.118": -0.118, "Fib_-0.216": -0.216,
+        "Fib_-0.270": -0.270, "Fib_-0.414": -0.414, "Fib_-0.618": -0.618,
+        "Fib_-0.786": -0.786, "Fib_-1.000": -1.000,
     }
 
     def calculate_fibonacci(self, df: pd.DataFrame, mode: str) -> dict:
@@ -278,8 +279,8 @@ class TechnicalAgent:
         if len(df) < 3:
             return "VERİ_YETERSİZ"
 
-        prev = df.iloc[-2]
-        curr = df.iloc[-1]
+        prev       = df.iloc[-2]
+        curr       = df.iloc[-1]
         body       = abs(curr["close"] - curr["open"])
         wick_total = curr["high"] - curr["low"]
         upper_wick = curr["high"] - max(curr["open"], curr["close"])
@@ -321,15 +322,13 @@ class TechnicalAgent:
         rsi    = w["RSI"].values
         mid    = lookback // 2
 
-        p_first, p_second = prices[:mid], prices[mid:]
-        r_first, r_second = rsi[:mid],    rsi[mid:]
+        p_first,  p_second = prices[:mid], prices[mid:]
+        r_first,  r_second = rsi[:mid],    rsi[mid:]
 
-        # Bullish divergence: fiyat lower low, RSI higher low
         if (p_second.min() < p_first.min()
                 and r_second[p_second.argmin()] > r_first[p_first.argmin()]):
             return "POZITIF"
 
-        # Bearish divergence: fiyat higher high, RSI lower high
         if (p_second.max() > p_first.max()
                 and r_second[p_second.argmax()] < r_first[p_first.argmax()]):
             return "NEGATIF"
@@ -444,40 +443,40 @@ class TechnicalAgent:
     async def run_scheduler(self):
         logger.info("🚀 TechnicalAgent başlatıldı.")
         logger.info(f"   Semboller    : {SYMBOLS}")
-        logger.info(f"   Çalışma saati: {SAAT_BASLANGIC}:00 - {SAAT_BITIS}:00 TSİ")
+        logger.info(f"   Çalışma saati: {SAAT_BASLANGIC}:00 - {SAAT_BITIS}:00 TSİ (UTC+3)")
         logger.info(f"   0DTE  → {TABLE_0DTE}  | 5m  | dakikalar: {MINUTES_0DTE}")
         logger.info(f"   Swing → {TABLE_SWING} | 30m | dakikalar: {MINUTES_SWING}")
 
         await self.ensure_tables()
 
-        # İlk başlatmada warm-up (saatten bağımsız)
         logger.info("🔄 Başlangıç warm-up...")
         await asyncio.gather(*[self.run_swing(s) for s in SYMBOLS], return_exceptions=True)
         logger.info("✅ Başlangıç warm-up tamamlandı.")
 
-        last_run        = -1
-        saat_disi_log   = False   # Saat dışı logu bir kez yazdır
+        last_run      = -1
+        saat_disi_log = False
 
         while True:
-            now  = datetime.datetime.now()
+            # Saat kontrolü her zaman TSİ (UTC+3) üzerinden yapılır
+            now  = datetime.datetime.now(TSI)
             saat = now.hour
 
             # ── Çalışma saati dışı ───────────────────────────────────
             if not (SAAT_BASLANGIC <= saat < SAAT_BITIS):
                 if not saat_disi_log:
                     logger.info(
-                        f"😴 Saat {now.strftime('%H:%M')} — çalışma saati dışında "
+                        f"😴 TSİ {now.strftime('%H:%M')} — çalışma saati dışında "
                         f"({SAAT_BASLANGIC}:00-{SAAT_BITIS}:00 TSİ). Bekleniyor..."
                     )
                     saat_disi_log = True
-                    last_run      = -99   # Saat aralığına girilince warm-up tetiklensin
+                    last_run      = -99
                 await asyncio.sleep(30)
                 continue
 
             # ── Saat aralığına yeni girildi → gün başı warm-up ───────
             if last_run == -99:
                 logger.info(
-                    f"⏰ Saat {now.strftime('%H:%M')} — çalışma saati başladı, "
+                    f"⏰ TSİ {now.strftime('%H:%M')} — çalışma saati başladı, "
                     f"gün başı warm-up yapılıyor..."
                 )
                 self._swing_warmup_done.clear()
