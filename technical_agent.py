@@ -24,6 +24,7 @@ logger = logging.getLogger("TechnicalAgent")
 SYMBOLS        = ["SPY", "QQQ"]
 TABLE_0DTE     = "technical_0dte"
 TABLE_SWING    = "technical_swing"
+TABLE_DAILY    = "technical_daily"          # ← YENİ
 
 # Çalışma saatleri (TSİ = UTC+3)
 TSI            = datetime.timezone(datetime.timedelta(hours=3))
@@ -33,6 +34,8 @@ SAAT_BITIS     = 24   # 24:00 TSİ
 # Scheduler dakikaları
 MINUTES_0DTE   = [3, 8, 13, 18, 23, 28, 33, 38, 43, 48, 53, 58]
 MINUTES_SWING  = [27, 57]
+DAILY_HOUR     = 15   # ← YENİ: 15:55 TSİ
+DAILY_MINUTE   = 55   # ← YENİ
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,6 +51,7 @@ class TechnicalAgent:
 
         self._swing_cache: dict[str, pd.DataFrame] = {}
         self._swing_warmup_done: set[str]           = set()
+        self._last_daily_date: datetime.date | None = None  # ← YENİ: günde 1× kontrol
 
     # ─────────────────────────────────────────────────────────────────────────
     # DB POOL
@@ -92,7 +96,7 @@ class TechnicalAgent:
             for table in [TABLE_0DTE, TABLE_SWING]:
                 safe = table.replace("-", "_")
                 await conn.execute(ddl.format(table=table, safe=safe))
-        logger.info(f"✅ Tablolar hazır: {TABLE_0DTE}, {TABLE_SWING}")
+        logger.info(f"✅ Tablolar hazır: {TABLE_0DTE}, {TABLE_SWING}, {TABLE_DAILY}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # VERİ ÇEKME
@@ -137,6 +141,10 @@ class TechnicalAgent:
 
     def fetch_30m(self, symbol: str, period: str = "60d") -> pd.DataFrame:
         return self._fetch_yfinance(symbol, interval="30m", period=period)
+
+    def fetch_1d(self, symbol: str) -> pd.DataFrame:
+        """Günlük mumlar — 365 gün geçmiş (SMA200 için yeterli)."""
+        return self._fetch_yfinance(symbol, interval="1d", period="365d")
 
     # ─────────────────────────────────────────────────────────────────────────
     # SWING CACHE
@@ -184,7 +192,7 @@ class TechnicalAgent:
             elif p < e9:       return "AYI_ZAYIF"
             return "YATAY"
 
-        else:  # swing
+        else:  # swing ve daily — EMA21 + SMA50 + SMA200
             if len(df) < 50:
                 return "VERİ_YETERSİZ"
             e21  = ta.trend.ema_indicator(close, window=21).iloc[-1]
@@ -313,7 +321,7 @@ class TechnicalAgent:
         return "YOK"
 
     # ─────────────────────────────────────────────────────────────────────────
-    # ANA HESAPLAMA
+    # ANA HESAPLAMA (0DTE + SWING)
     # ─────────────────────────────────────────────────────────────────────────
     async def calculate(self, df: pd.DataFrame, mode: str) -> dict | None:
         min_rows = 21 if mode == "0dte" else 50
@@ -356,7 +364,93 @@ class TechnicalAgent:
             return None
 
     # ─────────────────────────────────────────────────────────────────────────
-    # DB KAYIT
+    # DAILY HESAPLAMA ← YENİ
+    # ─────────────────────────────────────────────────────────────────────────
+    async def calculate_daily(self, df: pd.DataFrame, symbol: str) -> dict | None:
+        """
+        Günlük (1d) teknik indikatörler.
+        15:55 TSİ = 08:55 ET — piyasa henüz açılmadı,
+        dolayısıyla son tamamlanmış mum = önceki iş günü kapanışı.
+        """
+        if df.empty or len(df) < 50:
+            logger.warning(f"⚠️ [DAILY] {symbol} yetersiz veri: {len(df)} mum")
+            return None
+
+        try:
+            df = df.copy()
+
+            # ── İndikatörler ──────────────────────────────────────────
+            close  = df["close"]
+            df["EMA21"]      = ta.trend.ema_indicator(close, window=21)
+            df["SMA50"]      = ta.trend.sma_indicator(close, window=50)
+            df["RSI"]        = ta.momentum.rsi(close, window=14)
+            df["ATR"]        = ta.volatility.average_true_range(
+                                   df["high"], df["low"], close, window=14)
+
+            if len(df) >= 200:
+                df["SMA200"] = ta.trend.sma_indicator(close, window=200)
+            else:
+                df["SMA200"] = None
+
+            # MACD
+            macd_obj         = ta.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
+            df["MACD"]       = macd_obj.macd()
+            df["MACD_SIGNAL"]= macd_obj.macd_signal()
+            df["MACD_HIST"]  = macd_obj.macd_diff()
+
+            # Hacim oranı: son gün / 20 günlük ortalama
+            df["VOL_ORT20"]  = df["volume"].rolling(20).mean()
+
+            # Son tamamlanmış mum (en son satır)
+            son = df.iloc[-1]
+
+            def r2(v):
+                return round(float(v), 2) if pd.notna(v) else None
+
+            def r4(v):
+                return round(float(v), 4) if pd.notna(v) else None
+
+            hacim_oran = None
+            if pd.notna(son["VOL_ORT20"]) and son["VOL_ORT20"] > 0:
+                hacim_oran = round(float(son["volume"]) / float(son["VOL_ORT20"]), 2)
+
+            trend     = self.detect_trend(df, mode="swing")  # aynı EMA21/SMA50/SMA200 mantığı
+            formation = self.detect_candle(df)
+
+            result = {
+                "symbol":      symbol,
+                "tarih":       son["timestamp"].date() if hasattr(son["timestamp"], "date") else str(son["timestamp"])[:10],
+                "open":        r2(son["open"]),
+                "high":        r2(son["high"]),
+                "low":         r2(son["low"]),
+                "close":       r2(son["close"]),
+                "volume":      int(son["volume"]) if pd.notna(son["volume"]) else None,
+                "ema21":       r2(son["EMA21"]),
+                "sma50":       r2(son["SMA50"]),
+                "sma200":      r2(son["SMA200"]) if "SMA200" in df.columns else None,
+                "rsi":         r2(son["RSI"]),
+                "macd":        r4(son["MACD"]),
+                "macd_signal": r4(son["MACD_SIGNAL"]),
+                "macd_hist":   r4(son["MACD_HIST"]),
+                "trend":       trend,
+                "formation":   formation,
+                "hacim_oran":  hacim_oran,
+                "atr":         r2(son["ATR"]),
+            }
+
+            logger.info(
+                f"📅 [DAILY] {symbol} {result['tarih']} | "
+                f"Kapanış: {result['close']} | RSI: {result['rsi']} | "
+                f"Trend: {trend} | Form: {formation} | Hacim: {hacim_oran}x"
+            )
+            return result
+
+        except Exception as e:
+            logger.error(f"❌ [DAILY] Hesaplama hatası ({symbol}): {e}")
+            return None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # DB KAYIT (0DTE + SWING)
     # ─────────────────────────────────────────────────────────────────────────
     async def save(self, symbol: str, timeframe: str, data: dict, mode: str):
         if not data:
@@ -394,6 +488,63 @@ class TechnicalAgent:
             logger.error(f"❌ DB kayıt hatası ({symbol} {mode}): {e}")
 
     # ─────────────────────────────────────────────────────────────────────────
+    # DAILY DB KAYIT ← YENİ
+    # ─────────────────────────────────────────────────────────────────────────
+    async def save_daily(self, data: dict):
+        """
+        technical_daily tablosuna yazar.
+        Aynı gün + sembol için ON CONFLICT ile günceller.
+        """
+        if not data:
+            return
+
+        try:
+            pool = await self.get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    f"""
+                    INSERT INTO {TABLE_DAILY}
+                        (symbol, tarih, open, high, low, close, volume,
+                         ema21, sma50, sma200, rsi,
+                         macd, macd_signal, macd_hist,
+                         trend, formation, hacim_oran, atr)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                    ON CONFLICT (symbol, tarih) DO UPDATE SET
+                        open        = EXCLUDED.open,
+                        high        = EXCLUDED.high,
+                        low         = EXCLUDED.low,
+                        close       = EXCLUDED.close,
+                        volume      = EXCLUDED.volume,
+                        ema21       = EXCLUDED.ema21,
+                        sma50       = EXCLUDED.sma50,
+                        sma200      = EXCLUDED.sma200,
+                        rsi         = EXCLUDED.rsi,
+                        macd        = EXCLUDED.macd,
+                        macd_signal = EXCLUDED.macd_signal,
+                        macd_hist   = EXCLUDED.macd_hist,
+                        trend       = EXCLUDED.trend,
+                        formation   = EXCLUDED.formation,
+                        hacim_oran  = EXCLUDED.hacim_oran,
+                        atr         = EXCLUDED.atr,
+                        timestamp   = NOW()
+                    """,
+                    data["symbol"],
+                    data["tarih"],
+                    data["open"],    data["high"],  data["low"],   data["close"],
+                    data["volume"],
+                    data["ema21"],   data["sma50"], data["sma200"],
+                    data["rsi"],
+                    data["macd"],    data["macd_signal"], data["macd_hist"],
+                    data["trend"],   data["formation"],
+                    data["hacim_oran"], data["atr"],
+                )
+            logger.info(
+                f"💾 [DAILY] {data['symbol']} {data['tarih']} → {TABLE_DAILY} ✅"
+            )
+        except Exception as e:
+            logger.error(f"❌ [DAILY] DB kayıt hatası ({data.get('symbol')}): {e}")
+
+    # ─────────────────────────────────────────────────────────────────────────
     # ÇALIŞTIRICILAR
     # ─────────────────────────────────────────────────────────────────────────
     async def run_0dte(self, symbol: str):
@@ -410,15 +561,24 @@ class TechnicalAgent:
         data = await self.calculate(df, mode="swing")
         await self.save(symbol, "30m", data, mode="swing")
 
+    async def run_daily(self, symbol: str):
+        """Günde bir kez — 15:55 TSİ. Önceki iş günü kapanışını yazar."""
+        df = await asyncio.to_thread(self.fetch_1d, symbol)
+        if df.empty:
+            return
+        data = await self.calculate_daily(df, symbol)
+        await self.save_daily(data)
+
     # ─────────────────────────────────────────────────────────────────────────
     # SCHEDULER
     # ─────────────────────────────────────────────────────────────────────────
     async def run_scheduler(self):
         logger.info("🚀 TechnicalAgent başlatıldı.")
         logger.info(f"   Semboller    : {SYMBOLS}")
-        logger.info(f"   Çalışma saati: {SAAT_BASLANGIC}:00 - {SAAT_BITIS}:00 TSİ (UTC+3)")
+        logger.info(f"   Çalışma saati: {SAAT_BASLANGIC}:00 - {SAAT_BITIS}:00 TSİ")
         logger.info(f"   0DTE  → {TABLE_0DTE}  | 5m  | dakikalar: {MINUTES_0DTE}")
         logger.info(f"   Swing → {TABLE_SWING} | 30m | dakikalar: {MINUTES_SWING}")
+        logger.info(f"   Daily → {TABLE_DAILY} | 1d  | her gün {DAILY_HOUR}:{DAILY_MINUTE:02d} TSİ")
 
         await self.ensure_tables()
 
@@ -437,8 +597,7 @@ class TechnicalAgent:
             if not (SAAT_BASLANGIC <= saat < SAAT_BITIS):
                 if not saat_disi_log:
                     logger.info(
-                        f"😴 TSİ {now.strftime('%H:%M')} — çalışma saati dışında "
-                        f"({SAAT_BASLANGIC}:00-{SAAT_BITIS}:00 TSİ). Bekleniyor..."
+                        f"😴 TSİ {now.strftime('%H:%M')} — çalışma saati dışında. Bekleniyor..."
                     )
                     saat_disi_log = True
                     last_run      = -99
@@ -447,10 +606,7 @@ class TechnicalAgent:
 
             # ── Saat aralığına yeni girildi → gün başı warm-up ───────
             if last_run == -99:
-                logger.info(
-                    f"⏰ TSİ {now.strftime('%H:%M')} — çalışma saati başladı, "
-                    f"gün başı warm-up yapılıyor..."
-                )
+                logger.info(f"⏰ TSİ {now.strftime('%H:%M')} — gün başı warm-up...")
                 self._swing_warmup_done.clear()
                 self._swing_cache.clear()
                 await asyncio.gather(*[self.run_swing(s) for s in SYMBOLS], return_exceptions=True)
@@ -458,7 +614,20 @@ class TechnicalAgent:
                 saat_disi_log = False
                 last_run      = -1
 
-            # ── Normal çalışma ────────────────────────────────────────
+            # ── Daily: 15:55 TSİ, günde bir kez ─────────────────────
+            today = now.date()
+            if (saat == DAILY_HOUR
+                    and now.minute == DAILY_MINUTE
+                    and self._last_daily_date != today):
+                logger.info(f"📅 TSİ {now.strftime('%H:%M')} — günlük veri çekiliyor...")
+                await asyncio.gather(
+                    *[self.run_daily(s) for s in SYMBOLS],
+                    return_exceptions=True
+                )
+                self._last_daily_date = today
+                logger.info("✅ Günlük veri yazıldı.")
+
+            # ── Normal çalışma (0DTE + Swing) ────────────────────────
             if now.minute != last_run:
                 tasks = []
                 for sym in SYMBOLS:
